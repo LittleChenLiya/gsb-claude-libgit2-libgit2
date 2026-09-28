@@ -1053,6 +1053,539 @@ int git_tree_walk(
 	return error;
 }
 
+/*
+ * Read-only checkout safety checking
+ *
+ * A tree is walked as if it were about to be checked out. Under a
+ * case-insensitive policy, entries that the filesystem would fold onto
+ * the same name are grouped (and directories merged and descended into
+ * together), and every path that could not be represented safely is
+ * recorded.
+ */
+
+typedef struct {
+	char *path;
+	uint32_t issues;
+} tree_pathcheck_issue;
+
+typedef struct {
+	const git_tree_entry *entry;
+	char *full_path;
+	char *folded_name;
+	size_t folded_name_len;
+	uint32_t own_issues;
+	uint32_t inherited_issues;
+} tree_pathcheck_row;
+
+typedef struct {
+	const git_tree *tree;
+	char *prefix;
+	uint32_t inherited_issues;
+} tree_pathcheck_member;
+
+typedef struct {
+	git_repository *repo;
+	git_vector issues;
+} tree_pathcheck_state;
+
+static int tree_pathcheck_issue_cmp(const void *a, const void *b)
+{
+	const tree_pathcheck_issue *ia = (const tree_pathcheck_issue *)a;
+	const tree_pathcheck_issue *ib = (const tree_pathcheck_issue *)b;
+
+	return strcmp(ia->path, ib->path);
+}
+
+static int tree_pathcheck_row_cmp(const void *a, const void *b)
+{
+	const tree_pathcheck_row *ra = (const tree_pathcheck_row *)a;
+	const tree_pathcheck_row *rb = (const tree_pathcheck_row *)b;
+	size_t common = (ra->folded_name_len < rb->folded_name_len) ?
+		ra->folded_name_len : rb->folded_name_len;
+	int cmp = memcmp(ra->folded_name, rb->folded_name, common);
+
+	if (cmp != 0)
+		return cmp;
+
+	if (ra->folded_name_len == rb->folded_name_len)
+		return 0;
+
+	return (ra->folded_name_len < rb->folded_name_len) ? -1 : 1;
+}
+
+/* Fold a single path component the way a Windows-compatible filesystem
+ * would when resolving it: ASCII uppercase letters are lowercased and
+ * trailing dots and spaces are dropped. Non-ASCII bytes are left
+ * untouched; no invented Unicode folding is applied. The component's
+ * own validity issues are returned.
+ */
+static uint32_t tree_pathcheck_fold_component(
+	char **out,
+	size_t *out_len,
+	const char *name,
+	size_t len)
+{
+	char *folded;
+	size_t trimmed = len, i;
+	uint32_t issues = 0;
+
+	while (trimmed > 0 &&
+	       (name[trimmed - 1] == '.' || name[trimmed - 1] == ' ')) {
+		if (name[trimmed - 1] == '.')
+			issues |= GIT_TREE_PATH_ISSUE_TRAILING_DOT;
+		else
+			issues |= GIT_TREE_PATH_ISSUE_TRAILING_SPACE;
+		trimmed--;
+	}
+
+	folded = git__malloc(trimmed + 1);
+	if (folded == NULL) {
+		*out = NULL;
+		return 0;
+	}
+
+	for (i = 0; i < trimmed; i++) {
+		unsigned char c = (const unsigned char)name[i];
+		folded[i] = (c >= 'A' && c <= 'Z') ?
+			(char)(c + ('a' - 'A')) : (char)c;
+	}
+
+	folded[trimmed] = '\0';
+	*out = folded;
+	*out_len = trimmed;
+
+	if (git_fs_path_is_dos_reserved_component(name, len))
+		issues |= GIT_TREE_PATH_ISSUE_RESERVED_NAME;
+
+	return issues;
+}
+
+static char *tree_pathcheck_join(const char *prefix, const git_tree_entry *entry)
+{
+	git_str path = GIT_STR_INIT;
+
+	if (git_str_puts(&path, prefix) < 0 ||
+	    (prefix[0] != '\0' && git_str_putc(&path, '/') < 0) ||
+	    git_str_put(&path, entry->filename, entry->filename_len) < 0) {
+		git_str_dispose(&path);
+		return NULL;
+	}
+
+	return git_str_detach(&path);
+}
+
+static int tree_pathcheck_record(
+	tree_pathcheck_state *state,
+	char *path,
+	uint32_t issues)
+{
+	tree_pathcheck_issue *issue;
+
+	if (issues == 0) {
+		git__free(path);
+		return 0;
+	}
+
+	issue = git__malloc(sizeof(tree_pathcheck_issue));
+	if (issue == NULL) {
+		git__free(path);
+		return -1;
+	}
+
+	issue->path = path;
+	issue->issues = issues;
+
+	if (git_vector_insert(&state->issues, issue) < 0) {
+		git__free(path);
+		git__free(issue);
+		return -1;
+	}
+
+	return 0;
+}
+
+static tree_pathcheck_row *tree_pathcheck_row_new(
+	const git_tree_entry *entry,
+	const char *prefix,
+	uint32_t inherited_issues)
+{
+	tree_pathcheck_row *row = git__malloc(sizeof(tree_pathcheck_row));
+
+	if (row == NULL)
+		return NULL;
+
+	memset(row, 0, sizeof(*row));
+	row->entry = entry;
+	row->inherited_issues = inherited_issues;
+	row->full_path = tree_pathcheck_join(prefix, entry);
+
+	if (row->full_path == NULL) {
+		git__free(row);
+		return NULL;
+	}
+
+	row->own_issues = tree_pathcheck_fold_component(
+		&row->folded_name, &row->folded_name_len,
+		entry->filename, entry->filename_len);
+
+	if (row->folded_name == NULL) {
+		git__free(row->full_path);
+		git__free(row);
+		return NULL;
+	}
+
+	return row;
+}
+
+static void tree_pathcheck_rows_dispose(git_vector *rows)
+{
+	size_t i;
+
+	for (i = 0; i < rows->length; i++) {
+		tree_pathcheck_row *row = git_vector_get(rows, i);
+		git__free(row->folded_name);
+		if (row->full_path)
+			git__free(row->full_path);
+		git__free(row);
+	}
+
+	git_vector_dispose(rows);
+}
+
+static int tree_pathcheck_rows(
+	tree_pathcheck_state *state,
+	git_vector *rows);
+
+/* Descend into the directory entries of one collision group, merging
+ * their entries into a single synthetic directory.
+ */
+static int tree_pathcheck_merged_dirs(
+	tree_pathcheck_state *state,
+	tree_pathcheck_row **dirgroup,
+	size_t ndirs)
+{
+	git_vector members = GIT_VECTOR_INIT;
+	git_vector next = GIT_VECTOR_INIT;
+	tree_pathcheck_member *member;
+	tree_pathcheck_row *row;
+	const git_tree_entry *entry;
+	size_t i, j;
+	int error = -1;
+
+	if (git_vector_init(&members, ndirs, NULL) < 0 ||
+	    git_vector_init(&next, 0, tree_pathcheck_row_cmp) < 0)
+		goto done;
+
+	for (i = 0; i < ndirs; i++) {
+		git_tree *subtree;
+
+		if (git_tree_lookup(&subtree, state->repo,
+			&dirgroup[i]->entry->oid) < 0)
+			goto done;
+
+		member = git__malloc(sizeof(tree_pathcheck_member));
+		if (member == NULL) {
+			git_tree_free(subtree);
+			goto done;
+		}
+
+		member->tree = subtree;
+		member->prefix = dirgroup[i]->full_path;
+		member->inherited_issues =
+			dirgroup[i]->own_issues | dirgroup[i]->inherited_issues;
+
+		if (git_vector_insert(&members, member) < 0) {
+			git__free(member);
+			git_tree_free(subtree);
+			goto done;
+		}
+
+		/* ownership of the full path moved into the member */
+		dirgroup[i]->full_path = NULL;
+	}
+
+	for (i = 0; i < members.length; i++) {
+		member = git_vector_get(&members, i);
+
+		git_array_foreach(member->tree->entries, j, entry) {
+			row = tree_pathcheck_row_new(entry, member->prefix,
+				member->inherited_issues);
+			if (row == NULL)
+				goto done;
+
+			if (git_vector_insert(&next, row) < 0) {
+				git__free(row->folded_name);
+				git__free(row->full_path);
+				git__free(row);
+				goto done;
+			}
+		}
+	}
+
+	error = tree_pathcheck_rows(state, &next);
+
+done:
+	tree_pathcheck_rows_dispose(&next);
+	for (i = 0; i < members.length; i++) {
+		member = git_vector_get(&members, i);
+		git_tree_free((git_tree *)member->tree);
+		git__free(member->prefix);
+		git__free(member);
+	}
+	git_vector_dispose(&members);
+	return error;
+}
+
+/* Examine the rows of one directory: report bad components, group
+ * names that fold together, and descend into directories.
+ */
+static int tree_pathcheck_rows(
+	tree_pathcheck_state *state,
+	git_vector *rows)
+{
+	size_t group_start, i, j;
+
+	git_vector_sort(rows);
+
+	for (group_start = 0; group_start < rows->length; ) {
+		tree_pathcheck_row *first = git_vector_get(rows, group_start);
+		size_t group_end = group_start + 1;
+		size_t ndirs = 0;
+
+		while (group_end < rows->length) {
+			tree_pathcheck_row *other = git_vector_get(rows, group_end);
+
+			if (other->folded_name_len != first->folded_name_len ||
+			    memcmp(other->folded_name, first->folded_name,
+			           first->folded_name_len) != 0)
+				break;
+
+			group_end++;
+		}
+
+		for (i = group_start; i < group_end; i++) {
+			tree_pathcheck_row *row = git_vector_get(rows, i);
+			if (git_tree_entry__is_tree(row->entry))
+				ndirs++;
+		}
+
+		/* More than one entry sharing a folded name is a collision
+		 * unless the whole group is made of directories, which merge
+		 * cleanly on case-insensitive filesystems. */
+		if (group_end - group_start > 1 &&
+		    ndirs != group_end - group_start) {
+			for (i = group_start; i < group_end; i++) {
+				tree_pathcheck_row *row = git_vector_get(rows, i);
+
+				if (tree_pathcheck_record(state,
+					git__strdup(row->full_path),
+					GIT_TREE_PATH_ISSUE_CASE_COLLISION) < 0)
+					return -1;
+			}
+		}
+
+		if (ndirs > 0) {
+			tree_pathcheck_row **dirgroup;
+
+			dirgroup = git__mallocarray(ndirs, sizeof(tree_pathcheck_row *));
+			if (dirgroup == NULL)
+				return -1;
+
+			j = 0;
+			for (i = group_start; i < group_end; i++) {
+				tree_pathcheck_row *row = git_vector_get(rows, i);
+				uint32_t component_issues;
+
+				if (!git_tree_entry__is_tree(row->entry))
+					continue;
+
+				component_issues = row->own_issues | row->inherited_issues;
+
+				/* Bad parent components are reported for the directory
+				 * itself and inherited by every child below. */
+				if (component_issues &
+				    (GIT_TREE_PATH_ISSUE_TRAILING_DOT |
+				     GIT_TREE_PATH_ISSUE_TRAILING_SPACE |
+				     GIT_TREE_PATH_ISSUE_RESERVED_NAME)) {
+					if (tree_pathcheck_record(state,
+							git__strdup(row->full_path),
+							component_issues) < 0) {
+						git__free(dirgroup);
+						return -1;
+					}
+				}
+
+				dirgroup[j++] = row;
+			}
+
+			if (tree_pathcheck_merged_dirs(state, dirgroup, ndirs) < 0) {
+				git__free(dirgroup);
+				return -1;
+			}
+
+			git__free(dirgroup);
+		}
+
+		/* Leaves are reported directly. Directory paths have either been
+		 * reported above or moved into merged directory members. */
+		for (i = group_start; i < group_end; i++) {
+			tree_pathcheck_row *row = git_vector_get(rows, i);
+			uint32_t issues = row->own_issues | row->inherited_issues;
+
+			if (!git_tree_entry__is_tree(row->entry)) {
+				if (tree_pathcheck_record(state,
+						row->full_path, issues) < 0)
+					return -1;
+				row->full_path = NULL;
+			}
+		}
+
+		group_start = group_end;
+	}
+
+	return 0;
+}
+
+static void tree_pathcheck_issues_dispose(git_vector *issues)
+{
+	size_t i;
+
+	for (i = 0; i < issues->length; i++) {
+		tree_pathcheck_issue *issue = git_vector_get(issues, i);
+		git__free(issue->path);
+		git__free(issue);
+	}
+
+	git_vector_dispose(issues);
+}
+
+int git_tree_check_path_issues(
+	git_tree_path_issue_list **out,
+	const git_tree *tree,
+	git_tree_path_policy_t policy)
+{
+	tree_pathcheck_state state;
+	git_vector rows = GIT_VECTOR_INIT;
+	git_tree_path_issue_list *list = NULL;
+	const git_tree_entry *entry;
+	size_t i, j;
+	int error = -1;
+
+	assert(out && tree);
+	*out = NULL;
+
+	if (policy != GIT_TREE_PATH_POLICY_CASE_SENSITIVE &&
+	    policy != GIT_TREE_PATH_POLICY_WINDOWS) {
+		git_error_set(GIT_ERROR_INVALID, "invalid tree path policy");
+		return -1;
+	}
+
+	list = git__calloc(1, sizeof(git_tree_path_issue_list));
+	if (list == NULL)
+		return -1;
+
+	state.repo = tree->object.repo;
+	state.issues = (git_vector)GIT_VECTOR_INIT;
+	if (git_vector_init(&state.issues, 0,
+			tree_pathcheck_issue_cmp) < 0)
+		goto done;
+
+	/* A case-sensitive filesystem distinguishes every name the tree is
+	 * allowed to contain, so there is nothing to reject. */
+	if (policy == GIT_TREE_PATH_POLICY_WINDOWS) {
+		if (git_vector_init(&rows, git_tree_entrycount(tree),
+				tree_pathcheck_row_cmp) < 0)
+			goto done;
+
+		git_array_foreach(tree->entries, i, entry) {
+			tree_pathcheck_row *row =
+				tree_pathcheck_row_new(entry, "", 0);
+
+			if (row == NULL) {
+				tree_pathcheck_rows_dispose(&rows);
+				goto done;
+			}
+
+			if (git_vector_insert(&rows, row) < 0) {
+				git__free(row->folded_name);
+				git__free(row->full_path);
+				git__free(row);
+				tree_pathcheck_rows_dispose(&rows);
+				goto done;
+			}
+		}
+
+		if (tree_pathcheck_rows(&state, &rows) < 0) {
+			tree_pathcheck_rows_dispose(&rows);
+			goto done;
+		}
+
+		tree_pathcheck_rows_dispose(&rows);
+	}
+
+	git_vector_sort(&state.issues);
+
+	/* Merge duplicate reports for the same path and move the strings
+	 * into the public list. */
+	for (i = 0; i < state.issues.length; ) {
+		tree_pathcheck_issue *issue = git_vector_get(&state.issues, i);
+		git_tree_path_issue *items;
+		size_t end = i + 1;
+		uint32_t issues = issue->issues;
+
+		while (end < state.issues.length) {
+			tree_pathcheck_issue *next = git_vector_get(&state.issues, end);
+			if (strcmp(next->path, issue->path) != 0)
+				break;
+			issues |= next->issues;
+			end++;
+		}
+
+		items = git__reallocarray(list->items,
+			list->len + 1, sizeof(git_tree_path_issue));
+		if (items == NULL)
+			goto done;
+
+		list->items = items;
+		list->items[list->len].path = issue->path;
+		list->items[list->len].issues = issues;
+		list->len++;
+
+		/* Only the first duplicate keeps ownership of the path. */
+		for (j = i + 1; j < end; j++) {
+			tree_pathcheck_issue *dup = git_vector_get(&state.issues, j);
+			git__free(dup->path);
+			dup->path = NULL;
+		}
+
+		issue->path = NULL;
+		i = end;
+	}
+
+	*out = list;
+	list = NULL;
+	error = 0;
+
+done:
+	tree_pathcheck_issues_dispose(&state.issues);
+	git_tree_path_issue_list_free(list);
+	return error;
+}
+
+void git_tree_path_issue_list_free(git_tree_path_issue_list *list)
+{
+	size_t i;
+
+	if (list == NULL)
+		return;
+
+	for (i = 0; i < list->len; i++)
+		git__free(list->items[i].path);
+
+	git__free(list->items);
+	git__free(list);
+}
+
 static int compare_entries(const void *_a, const void *_b)
 {
 	const git_tree_update *a = (git_tree_update *) _a;

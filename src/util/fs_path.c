@@ -1611,6 +1611,16 @@ GIT_INLINE(bool) validate_dospath(
 		component[last] != ':');
 }
 
+bool git_fs_path_is_dos_reserved_component(const char *component, size_t len)
+{
+	return (!validate_dospath(component, len, "CON", false) ||
+		!validate_dospath(component, len, "PRN", false) ||
+		!validate_dospath(component, len, "AUX", false) ||
+		!validate_dospath(component, len, "NUL", false) ||
+		!validate_dospath(component, len, "COM", true)  ||
+		!validate_dospath(component, len, "LPT", true));
+}
+
 GIT_INLINE(bool) validate_char(unsigned char c, unsigned int flags)
 {
 	if ((flags & GIT_FS_PATH_REJECT_BACKSLASH) && c == '\\')
@@ -1675,15 +1685,9 @@ static bool validate_component(
 	    component[len - 1] == ':')
 		return false;
 
-	if (flags & GIT_FS_PATH_REJECT_DOS_PATHS) {
-		if (!validate_dospath(component, len, "CON", false) ||
-		    !validate_dospath(component, len, "PRN", false) ||
-		    !validate_dospath(component, len, "AUX", false) ||
-		    !validate_dospath(component, len, "NUL", false) ||
-		    !validate_dospath(component, len, "COM", true)  ||
-		    !validate_dospath(component, len, "LPT", true))
-			return false;
-	}
+	if ((flags & GIT_FS_PATH_REJECT_DOS_PATHS) &&
+	    git_fs_path_is_dos_reserved_component(component, len))
+		return false;
 
 	return true;
 }

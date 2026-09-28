@@ -636,6 +636,15 @@ extern int git_fs_path_from_url_or_path(git_str *local_path_out, const char *url
 
 #define GIT_FS_PATH_REJECT_MAX                (1 << 9)
 
+/**
+ * Check whether a single path component is a DOS reserved device name,
+ * such as "CON", "AUX", "COM1", or any of those followed by a dot or
+ * colon (and optionally further characters). The comparison is
+ * restricted to ASCII; no non-ASCII case folding is performed.
+ */
+extern bool git_fs_path_is_dos_reserved_component(
+	const char *component, size_t len);
+
 /* Default path safety for writing files to disk: since we use the
  * Win32 "File Namespace" APIs ("\\?\") we need to protect from
  * paths that the normal Win32 APIs would not write.

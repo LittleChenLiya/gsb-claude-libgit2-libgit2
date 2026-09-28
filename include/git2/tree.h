@@ -480,6 +480,96 @@ typedef struct {
  */
 GIT_EXTERN(int) git_tree_create_updated(git_oid *out, git_repository *repo, git_tree *baseline, size_t nupdates, const git_tree_update *updates);
 
+/**
+ * Filesystem policy used to determine whether the paths in a tree can
+ * be safely checked out.
+ */
+typedef enum {
+	/** Case-sensitive filesystem (for example Linux ext4, or macOS
+	 *  APFS with a case-sensitive scheme). Paths that differ only in
+	 *  case are distinct and never collide. */
+	GIT_TREE_PATH_POLICY_CASE_SENSITIVE = 0,
+	/** Windows-compatible filesystem. Components are folded using
+	 *  ASCII case rules, trailing dots and spaces are stripped, and
+	 *  DOS reserved device names are rejected. No non-ASCII case
+	 *  folding is performed. */
+	GIT_TREE_PATH_POLICY_WINDOWS = 1
+} git_tree_path_policy_t;
+
+/**
+ * The reason why a path in a tree cannot be safely checked out.
+ */
+typedef enum {
+	/** Two entries differ only in case, or otherwise normalize to
+	 *  the same component under the policy (for example "A.txt" and
+	 *  "a.txt" on Windows). */
+	GIT_TREE_PATH_ISSUE_CASE_COLLISION = (1 << 0),
+	/** A path component has a trailing dot (for example "foo."). */
+	GIT_TREE_PATH_ISSUE_TRAILING_DOT = (1 << 1),
+	/** A path component has trailing spaces (for example "foo "). */
+	GIT_TREE_PATH_ISSUE_TRAILING_SPACE = (1 << 2),
+	/** A path component is a DOS reserved device name such as
+	 *  "CON", "AUX" or "COM1". */
+	GIT_TREE_PATH_ISSUE_RESERVED_NAME = (1 << 3)
+} git_tree_path_issue_t;
+
+/**
+ * A single path that is unsafe to check out under the requested
+ * policy.
+ */
+typedef struct {
+	/** Full path of the offending entry, relative to the root tree,
+	 *  using forward slashes. */
+	char *path;
+	/** A combination of `git_tree_path_issue_t` values describing
+	 *  why the path is unsafe. */
+	uint32_t issues;
+} git_tree_path_issue;
+
+/**
+ * The result of a `git_tree_check_path_issues()` invocation. The
+ * reported paths are sorted by the raw Git path byte order.
+ */
+typedef struct {
+	git_tree_path_issue *items;
+	size_t len;
+} git_tree_path_issue_list;
+
+/**
+ * Check whether all paths contained in a tree can be safely checked
+ * out under the given filesystem policy.
+ *
+ * This is a read-only operation: it only inspects the tree and the
+ * objects it references, and never touches the working directory.
+ *
+ * The check is recursive: subtrees are descended into and directory
+ * names are examined as well as file names. Directories that fold to
+ * the same name are merged before their contents are examined, so
+ * collisions introduced by an enclosing case fold are detected.
+ * Submodules (gitlinks) are treated as leaf entries. Non-ASCII bytes
+ * are never case folded; only ASCII uppercase letters are
+ * lowercased for the Windows policy.
+ *
+ * @param[out] out Pointer that receives the list of unsafe paths;
+ * must be freed with `git_tree_path_issue_list_free()`. The list is
+ * empty (length zero) when the tree is safe to check out.
+ * @param tree The tree to inspect.
+ * @param policy The filesystem policy to check the tree against.
+ * @return 0 or an error code.
+ */
+GIT_EXTERN(int) git_tree_check_path_issues(
+	git_tree_path_issue_list **out,
+	const git_tree *tree,
+	git_tree_path_policy_t policy);
+
+/**
+ * Free a path issue list returned by `git_tree_check_path_issues()`.
+ *
+ * @param list The list to free; may be NULL.
+ */
+GIT_EXTERN(void) git_tree_path_issue_list_free(
+	git_tree_path_issue_list *list);
+
 /** @} */
 GIT_END_DECL
 
