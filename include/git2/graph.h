@@ -77,6 +77,98 @@ GIT_EXTERN(int) git_graph_reachable_from_any(
 	const git_oid descendant_array[],
 	size_t length);
 
+/**
+ * The reason why a commit graph traversal could not continue past a
+ * given parent edge.
+ */
+typedef enum {
+	/** The commit on the edge is part of the caller-provided stop set. */
+	GIT_GRAPH_BOUNDARY_STOP = 1,
+
+	/** The parent commit object does not exist in the local object store. */
+	GIT_GRAPH_BOUNDARY_MISSING,
+
+	/** The parent commit object exists but could not be read or parsed. */
+	GIT_GRAPH_BOUNDARY_ERROR
+} git_graph_boundary_reason;
+
+/**
+ * A parent edge at which a commit graph traversal stopped.
+ *
+ * The edge goes from the commit `from` (which was visited) to its
+ * parent `to` (which was not visited). When a starting commit is
+ * itself part of the stop set, `from` and `to` are identical.
+ */
+typedef struct {
+	git_oid from;
+	git_oid to;
+	git_graph_boundary_reason reason;
+} git_graph_boundary_edge;
+
+/**
+ * The result of a read-only commit graph traversal.
+ *
+ * `visited` contains the commits that were reached and expanded during
+ * the traversal; `edges` contains the boundary edges at which the
+ * traversal stopped, along with the reason for each stop.
+ *
+ * Free with `git_graph_report_free`.
+ */
+typedef struct {
+	git_oid *visited;
+	size_t visited_count;
+	git_graph_boundary_edge *edges;
+	size_t edge_count;
+} git_graph_report;
+
+/**
+ * Traverse the commit graph from a set of starting commits, following
+ * all parent edges, and report which commits were visited and where
+ * the traversal stopped.
+ *
+ * The traversal is strictly read-only: it only reads objects from the
+ * local object store and never fetches missing objects, nor modifies
+ * references, the index or the working directory.
+ *
+ * Commits in the `stops` set are never visited; instead, each edge
+ * leading to them is reported as a boundary edge with reason
+ * `GIT_GRAPH_BOUNDARY_STOP`. A starting commit that is itself in the
+ * stop set is reported as a boundary edge from itself to itself.
+ *
+ * When a parent commit is not present in the local object store, the
+ * edge to it is reported with `GIT_GRAPH_BOUNDARY_MISSING`; when the
+ * parent object exists but cannot be read or parsed (for example a
+ * corrupt object), the edge is reported with `GIT_GRAPH_BOUNDARY_ERROR`.
+ * In both cases the traversal continues with the remaining parents.
+ *
+ * All starting commits must exist and be readable commits; if any
+ * starting commit cannot be loaded, an error is returned and no report
+ * is produced.
+ *
+ * @param[out] out the resulting traversal report; free with
+ * `git_graph_report_free`
+ * @param repo the repository where the commits exist
+ * @param starts the commits to start traversing from
+ * @param starts_len the number of commits in `starts`
+ * @param stops the commits at which to stop traversing
+ * @param stops_len the number of commits in `stops`
+ * @return 0 or an error code.
+ */
+GIT_EXTERN(int) git_graph_traverse(
+	git_graph_report **out,
+	git_repository *repo,
+	const git_oid *starts,
+	size_t starts_len,
+	const git_oid *stops,
+	size_t stops_len);
+
+/**
+ * Free a commit graph traversal report.
+ *
+ * @param report the report to free, or NULL
+ */
+GIT_EXTERN(void) git_graph_report_free(git_graph_report *report);
+
 /** @} */
 GIT_END_DECL
 

@@ -9,6 +9,9 @@
 
 #include "revwalk.h"
 #include "merge.h"
+#include "pool.h"
+#include "array.h"
+#include "hashmap_oid.h"
 #include "git2/graph.h"
 
 static int interesting(git_pqueue *list, git_commit_list *roots)
@@ -246,4 +249,225 @@ done:
 	git_vector_dispose(&list);
 	git_revwalk_free(walk);
 	return error;
+}
+
+/*
+ * Read-only commit graph traversal reporting.
+ */
+
+GIT_HASHMAP_OID_SETUP(git_graph__oidset, GIT_HASHSET_VAL_T);
+
+typedef struct {
+	git_repository *repo;
+	git_graph__oidset stops;
+	git_graph__oidset seen;
+	git_pool pool;
+	git_array_t(git_oid) queue;
+	size_t queue_pos;
+	git_array_t(git_oid) visited;
+	git_array_t(git_graph_boundary_edge) edges;
+} git_graph__traversal;
+
+static int git_graph__oidset_add(
+	git_graph__oidset *set, git_pool *pool, const git_oid *oid)
+{
+	git_oid *key;
+
+	if (git_graph__oidset_contains(set, oid))
+		return 0;
+
+	key = git_pool_malloc(pool, 1);
+	GIT_ERROR_CHECK_ALLOC(key);
+
+	git_oid_cpy(key, oid);
+
+	return git_graph__oidset_put(set, key, NULL);
+}
+
+static int git_graph__add_edge(
+	git_graph__traversal *t,
+	const git_oid *from,
+	const git_oid *to,
+	git_graph_boundary_reason reason)
+{
+	git_graph_boundary_edge *edge;
+
+	edge = git_array_alloc(t->edges);
+	GIT_ERROR_CHECK_ALLOC(edge);
+
+	git_oid_cpy(&edge->from, from);
+	git_oid_cpy(&edge->to, to);
+	edge->reason = reason;
+
+	return 0;
+}
+
+static int git_graph__enqueue(git_graph__traversal *t, const git_oid *oid)
+{
+	git_oid *slot;
+
+	slot = git_array_alloc(t->queue);
+	GIT_ERROR_CHECK_ALLOC(slot);
+
+	git_oid_cpy(slot, oid);
+
+	return git_graph__oidset_add(&t->seen, &t->pool, oid);
+}
+
+static int git_graph__visit_parents(git_graph__traversal *t, git_commit *commit)
+{
+	git_oid from;
+	unsigned int i, parent_count;
+	int error = 0;
+
+	git_oid_cpy(&from, git_commit_id(commit));
+	parent_count = git_commit_parentcount(commit);
+
+	for (i = 0; i < parent_count; i++) {
+		const git_oid *parent_id = git_commit_parent_id(commit, i);
+		git_commit *parent = NULL;
+		int lookup_error;
+
+		if (git_graph__oidset_contains(&t->stops, parent_id)) {
+			if ((error = git_graph__add_edge(t, &from, parent_id,
+					GIT_GRAPH_BOUNDARY_STOP)) < 0)
+				return error;
+			continue;
+		}
+
+		if (git_graph__oidset_contains(&t->seen, parent_id))
+			continue;
+
+		lookup_error = git_commit_lookup(&parent, t->repo, parent_id);
+		if (lookup_error == GIT_ENOTFOUND) {
+			git_error_clear();
+			error = git_graph__add_edge(t, &from, parent_id,
+				GIT_GRAPH_BOUNDARY_MISSING);
+		} else if (lookup_error < 0) {
+			git_error_clear();
+			error = git_graph__add_edge(t, &from, parent_id,
+				GIT_GRAPH_BOUNDARY_ERROR);
+		} else {
+			git_commit_free(parent);
+			error = git_graph__enqueue(t, parent_id);
+		}
+
+		if (error < 0)
+			return error;
+	}
+
+	return 0;
+}
+
+int git_graph_traverse(
+	git_graph_report **out,
+	git_repository *repo,
+	const git_oid *starts,
+	size_t starts_len,
+	const git_oid *stops,
+	size_t stops_len)
+{
+	git_graph__traversal t = {0};
+	git_graph_report *report = NULL;
+	size_t i;
+	int error = 0;
+
+	GIT_ASSERT_ARG(out);
+	GIT_ASSERT_ARG(repo);
+	GIT_ASSERT_ARG(starts || !starts_len);
+	GIT_ASSERT_ARG(stops || !stops_len);
+
+	*out = NULL;
+
+	if ((error = git_pool_init(&t.pool, sizeof(git_oid))) < 0)
+		return error;
+
+	t.repo = repo;
+
+	for (i = 0; i < stops_len; i++) {
+		if ((error = git_graph__oidset_add(&t.stops, &t.pool, &stops[i])) < 0)
+			goto done;
+	}
+
+	for (i = 0; i < starts_len; i++) {
+		git_commit *commit = NULL;
+
+		if (git_graph__oidset_contains(&t.stops, &starts[i])) {
+			error = git_graph__add_edge(&t, &starts[i], &starts[i],
+				GIT_GRAPH_BOUNDARY_STOP);
+			if (error < 0)
+				goto done;
+			continue;
+		}
+
+		if (git_graph__oidset_contains(&t.seen, &starts[i]))
+			continue;
+
+		error = git_commit_lookup(&commit, repo, &starts[i]);
+		if (error < 0)
+			goto done;
+
+		git_commit_free(commit);
+
+		if ((error = git_graph__enqueue(&t, &starts[i])) < 0)
+			goto done;
+	}
+
+	while (t.queue_pos < git_array_size(t.queue)) {
+		git_commit *commit = NULL;
+		git_oid *slot, oid;
+
+		git_oid_cpy(&oid, &t.queue.ptr[t.queue_pos++]);
+
+		slot = git_array_alloc(t.visited);
+		if (!slot) {
+			error = -1;
+			goto done;
+		}
+		git_oid_cpy(slot, &oid);
+
+		error = git_commit_lookup(&commit, t.repo, &oid);
+		if (error < 0)
+			goto done;
+
+		error = git_graph__visit_parents(&t, commit);
+		git_commit_free(commit);
+		if (error < 0)
+			goto done;
+	}
+
+	report = git__calloc(1, sizeof(git_graph_report));
+	if (!report) {
+		error = -1;
+		goto done;
+	}
+
+	report->visited = t.visited.ptr;
+	report->visited_count = git_array_size(t.visited);
+	git_array_init(t.visited);
+
+	report->edges = t.edges.ptr;
+	report->edge_count = git_array_size(t.edges);
+	git_array_init(t.edges);
+
+	*out = report;
+
+done:
+	git_graph__oidset_dispose(&t.stops);
+	git_graph__oidset_dispose(&t.seen);
+	git_pool_clear(&t.pool);
+	git_array_clear(t.queue);
+	git_array_clear(t.visited);
+	git_array_clear(t.edges);
+	return error;
+}
+
+void git_graph_report_free(git_graph_report *report)
+{
+	if (!report)
+		return;
+
+	git__free(report->visited);
+	git__free(report->edges);
+	git__free(report);
 }
