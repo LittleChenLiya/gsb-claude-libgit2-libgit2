@@ -480,6 +480,120 @@ typedef struct {
  */
 GIT_EXTERN(int) git_tree_create_updated(git_oid *out, git_repository *repo, git_tree *baseline, size_t nupdates, const git_tree_update *updates);
 
+/**
+ * Platform policies for validating that the paths in a tree can be
+ * safely checked out.
+ */
+typedef enum {
+	/** A case-sensitive platform (eg. Linux with a typical filesystem). */
+	GIT_TREE_PATH_PLATFORM_SENSITIVE = 0,
+
+	/** A Windows-compatible platform with its filename restrictions. */
+	GIT_TREE_PATH_PLATFORM_WINDOWS = 1
+} git_tree_path_platform_t;
+
+/**
+ * The kind of problem that prevents a tree entry path from being safely
+ * checked out on the selected platform.
+ */
+typedef enum {
+	/**
+	 * Two paths differ only by ASCII case, and would alias one another on
+	 * a case-insensitive filesystem.
+	 */
+	GIT_TREE_PATH_PROBLEM_CASE_COLLISION = 0,
+
+	/**
+	 * A path and a directory path would merge to the same name on a
+	 * case-insensitive filesystem (eg. `a.txt` and `A/a.txt`).
+	 */
+	GIT_TREE_PATH_PROBLEM_FILE_DIRECTORY_COLLISION = 1,
+
+	/**
+	 * A path component is a reserved Windows device name (eg. `con`,
+	 * `NUL`, `com1`).
+	 */
+	GIT_TREE_PATH_PROBLEM_RESERVED_NAME = 2,
+
+	/** A path component ends in a trailing dot. */
+	GIT_TREE_PATH_PROBLEM_TRAILING_DOT = 3,
+
+	/** A path component ends in a trailing space. */
+	GIT_TREE_PATH_PROBLEM_TRAILING_SPACE = 4
+} git_tree_path_problem_t;
+
+/**
+ * A single problematic path found while validating a tree.  The report
+ * owns the `path` string; callers must not free it.
+ */
+typedef struct {
+	/** The full path of the offending entry, relative to the tree root. */
+	const char *path;
+
+	/** The reason that the path cannot be safely checked out. */
+	git_tree_path_problem_t problem;
+} git_tree_path_problem;
+
+/**
+ * Validate that all the paths in a tree can be safely checked out on
+ * the given platform, without touching the working directory.
+ *
+ * The `GIT_TREE_PATH_PLATFORM_SENSITIVE` policy performs no folding or
+ * platform-specific name checks; it reports no problems.
+ *
+ * The `GIT_TREE_PATH_PLATFORM_WINDOWS` policy folds ASCII case (A-Z to
+ * a-z; non-ASCII bytes are left untouched, with no locale-specific
+ * folding), detects paths that would collide after that folding
+ * (including a file colliding with a directory), and rejects components
+ * that are reserved device names or that end in a trailing dot or
+ * space.  Submodule (gitlink) entries are validated by path like any
+ * other entry and are not descended into.
+ *
+ * The resulting entries are stably sorted by `path` in Git path byte
+ * order, then by `problem`.
+ *
+ * @param[out] out Pointer to the report; always populated, even when
+ * there are no problems, and must be freed with
+ * `git_tree_path_report_free`.
+ * @param tree The tree to validate.
+ * @param platform The platform policy to validate against.
+ * @return 0 on success or an error code.
+ */
+GIT_EXTERN(int) git_tree_path_report_new(
+	git_tree_path_report **out,
+	const git_tree *tree,
+	git_tree_path_platform_t platform);
+
+/**
+ * Get the number of problems in a report.
+ *
+ * @param report A report returned by `git_tree_path_report_new`.
+ * @return the number of problems
+ */
+GIT_EXTERN(size_t) git_tree_path_report_entrycount(
+	const git_tree_path_report *report);
+
+/**
+ * Get a pointer to one of the problems in a report.
+ *
+ * The returned entry is owned by the report and must not be freed.
+ *
+ * @param report A report.
+ * @param idx Position of the entry.
+ * @return Pointer to the entry; NULL if out of bounds.
+ */
+GIT_EXTERN(const git_tree_path_problem *) git_tree_path_report_byindex(
+	const git_tree_path_report *report,
+	size_t idx);
+
+/**
+ * Free a tree path validation report.
+ *
+ * @param report The report to free; this may be NULL.
+ */
+GIT_EXTERN(void) git_tree_path_report_free(
+	git_tree_path_report *report);
+
 /** @} */
 GIT_END_DECL
 

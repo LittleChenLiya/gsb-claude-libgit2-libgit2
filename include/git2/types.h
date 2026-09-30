@@ -147,6 +147,9 @@ typedef struct git_tree git_tree;
 /** Constructor for in-memory trees */
 typedef struct git_treebuilder git_treebuilder;
 
+/** Report of unsafe paths found while validating a tree. */
+typedef struct git_tree_path_report git_tree_path_report;
+
 /** Memory representation of an index file. */
 typedef struct git_index git_index;
 

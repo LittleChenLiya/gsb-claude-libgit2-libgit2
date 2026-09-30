@@ -1320,6 +1320,395 @@ cleanup:
 	return error;
 }
 
+struct git_tree_path_report {
+	git_vector problems; /* vector<git_tree_path_problem *> */
+};
+
+typedef struct {
+	char *path;
+	char *folded;
+	bool is_dir;
+} tree_path_entry;
+
+/*
+ * Fold ASCII case in place: A-Z becomes a-z, all other bytes (including
+ * high-bytes from non-ASCII UTF-8 sequences) are left untouched.
+ */
+static void tree_path_fold_ascii(char *folded)
+{
+	unsigned char *c;
+
+	for (c = (unsigned char *)folded; *c; c++) {
+		if (*c >= 'A' && *c <= 'Z')
+			*c += ('a' - 'A');
+	}
+}
+
+/*
+ * Match a single component against the Windows reserved device names,
+ * using the same rules as `validate_dospath` in fs_path.c: the bare
+ * name (CON, PRN, AUX, NUL), or a numbered port name (COM1..COM9,
+ * LPT1..LPT9), optionally followed by a dot or colon.  The comparison
+ * folds ASCII case only.
+ */
+static bool tree_path_is_reserved_device(
+	const char *component,
+	size_t len,
+	const char device[3],
+	bool numbered)
+{
+	size_t base_len = numbered ? 4 : 3;
+
+	if (len < base_len || git__strncasecmp(component, device, 3) != 0)
+		return false;
+
+	if (numbered && (component[3] < '1' || component[3] > '9'))
+		return false;
+
+	if (len > base_len &&
+	    component[base_len] != '.' &&
+	    component[base_len] != ':')
+		return false;
+
+	return true;
+}
+
+static bool tree_path_component_is_reserved(
+	const char *component,
+	size_t len)
+{
+	return tree_path_is_reserved_device(component, len, "CON", false) ||
+		tree_path_is_reserved_device(component, len, "PRN", false) ||
+		tree_path_is_reserved_device(component, len, "AUX", false) ||
+		tree_path_is_reserved_device(component, len, "NUL", false) ||
+		tree_path_is_reserved_device(component, len, "COM", true) ||
+		tree_path_is_reserved_device(component, len, "LPT", true);
+}
+
+static int tree_path_report_add(
+	git_tree_path_report *report,
+	const char *path,
+	git_tree_path_problem_t problem)
+{
+	git_tree_path_problem *item;
+
+	item = git__calloc(1, sizeof(git_tree_path_problem));
+	GIT_ERROR_CHECK_ALLOC(item);
+
+	item->problem = problem;
+	item->path = git__strdup(path);
+	GIT_ERROR_CHECK_ALLOC(item->path);
+
+	if (git_vector_insert(&report->problems, item) < 0) {
+		git__free((void *)item->path);
+		git__free(item);
+		return -1;
+	}
+
+	return 0;
+}
+
+static void tree_path_entry_free(tree_path_entry *entry)
+{
+	git__free(entry->path);
+	git__free(entry->folded);
+	git__free(entry);
+}
+
+static int tree_path_collect(
+	git_vector *entries,
+	const git_tree *tree,
+	git_str *prefix)
+{
+	int error = 0;
+	size_t i;
+	const git_tree_entry *tree_entry;
+
+	git_array_foreach(tree->entries, i, tree_entry) {
+		tree_path_entry *entry;
+		size_t prefix_len = git_str_len(prefix);
+		git_tree *subtree = NULL;
+
+		entry = git__calloc(1, sizeof(tree_path_entry));
+
+		if (!entry)
+			return -1;
+
+		entry->is_dir = git_tree_entry__is_tree(tree_entry);
+
+		if (git_str_puts(prefix, tree_entry->filename) < 0 ||
+		    (entry->path = git__strdup(prefix->ptr)) == NULL ||
+		    (entry->folded = git__strdup(prefix->ptr)) == NULL) {
+			tree_path_entry_free(entry);
+			git_str_truncate(prefix, prefix_len);
+			return -1;
+		}
+
+		tree_path_fold_ascii(entry->folded);
+
+		if ((error = git_vector_insert(entries, entry)) < 0) {
+			tree_path_entry_free(entry);
+			git_str_truncate(prefix, prefix_len);
+			return error;
+		}
+
+		if (entry->is_dir) {
+			error = git_tree_lookup(&subtree, tree->object.repo,
+				&tree_entry->oid);
+
+			if (error == 0) {
+				if (git_str_putc(prefix, '/') < 0 ||
+				    git_str_oom(prefix)) {
+					error = -1;
+				}
+				else {
+					error = tree_path_collect(entries, subtree, prefix);
+				}
+			}
+
+			git_tree_free(subtree);
+		}
+
+		git_str_truncate(prefix, prefix_len);
+
+		if (error < 0)
+			return error;
+	}
+
+	return 0;
+}
+
+static int tree_path_entries_cmp(const void *a, const void *b)
+{
+	const tree_path_entry *one = (const tree_path_entry *)a;
+	const tree_path_entry *two = (const tree_path_entry *)b;
+	int cmp = strcmp(one->folded, two->folded);
+
+	if (cmp)
+		return cmp;
+
+	return strcmp(one->path, two->path);
+}
+
+static int tree_path_problems_cmp(const void *a, const void *b)
+{
+	const git_tree_path_problem *one = (const git_tree_path_problem *)a;
+	const git_tree_path_problem *two = (const git_tree_path_problem *)b;
+	int cmp = strcmp(one->path, two->path);
+
+	if (cmp)
+		return cmp;
+
+	if (one->problem < two->problem)
+		return -1;
+	if (one->problem > two->problem)
+		return 1;
+	return 0;
+}
+
+int git_tree_path_report_new(
+	git_tree_path_report **out,
+	const git_tree *tree,
+	git_tree_path_platform_t platform)
+{
+	git_tree_path_report *report = NULL;
+	git_vector entries = GIT_VECTOR_INIT;
+	git_str prefix = GIT_STR_INIT;
+	int error = -1;
+	size_t i;
+
+	GIT_ASSERT_ARG(out);
+	GIT_ASSERT_ARG(tree);
+
+	*out = NULL;
+
+	if (platform != GIT_TREE_PATH_PLATFORM_SENSITIVE &&
+	    platform != GIT_TREE_PATH_PLATFORM_WINDOWS) {
+		git_error_set(GIT_ERROR_INVALID, "invalid tree path platform");
+		return GIT_EINVALIDSPEC;
+	}
+
+	report = git__calloc(1, sizeof(git_tree_path_report));
+	GIT_ERROR_CHECK_ALLOC(report);
+
+	if ((error = git_vector_init(&report->problems, 0,
+			tree_path_problems_cmp)) < 0)
+	{
+		git__free(report);
+		report = NULL;
+		goto done;
+	}
+
+	/* A case-sensitive platform imposes no platform-specific rules. */
+	if (platform == GIT_TREE_PATH_PLATFORM_SENSITIVE) {
+		error = 0;
+		goto done;
+	}
+
+	if ((error = git_vector_init(&entries, git_tree_entrycount(tree),
+			tree_path_entries_cmp)) < 0)
+		goto done;
+
+	if ((error = tree_path_collect(&entries, tree, &prefix)) < 0)
+		goto done;
+
+	/* Per-component Windows naming restrictions. */
+	{
+		tree_path_entry *entry;
+		const char *name;
+		size_t name_len;
+
+		for (i = 0; i < git_vector_length(&entries); i++) {
+			entry = git_vector_get(&entries, i);
+			name = strrchr(entry->path, '/');
+			name = name ? name + 1 : entry->path;
+			name_len = strlen(name);
+
+			if (name[name_len - 1] == '.') {
+				if ((error = tree_path_report_add(report, entry->path,
+						GIT_TREE_PATH_PROBLEM_TRAILING_DOT)) < 0)
+					goto done;
+			}
+
+			if (name[name_len - 1] == ' ') {
+				if ((error = tree_path_report_add(report, entry->path,
+						GIT_TREE_PATH_PROBLEM_TRAILING_SPACE)) < 0)
+					goto done;
+			}
+
+			if (tree_path_component_is_reserved(name, name_len)) {
+				if ((error = tree_path_report_add(report, entry->path,
+						GIT_TREE_PATH_PROBLEM_RESERVED_NAME)) < 0)
+					goto done;
+			}
+		}
+	}
+
+	/* Case folding collisions between entries. */
+	git_vector_sort(&entries);
+
+	{
+		size_t group_start, group_end;
+
+		for (group_start = 0;
+		     group_start < git_vector_length(&entries);
+		     group_start = group_end) {
+			size_t k;
+			bool has_dir = false;
+			size_t nleaves = 0;
+			const char *folded;
+			tree_path_entry *first;
+
+			first = git_vector_get(&entries, group_start);
+			folded = first->folded;
+
+			group_end = group_start + 1;
+			while (group_end < git_vector_length(&entries)) {
+				tree_path_entry *next;
+
+				next = git_vector_get(&entries, group_end);
+				if (strcmp(next->folded, folded) != 0)
+					break;
+				group_end++;
+			}
+
+			for (k = group_start; k < group_end; k++) {
+				tree_path_entry *entry;
+
+				entry = git_vector_get(&entries, k);
+				has_dir = has_dir || entry->is_dir;
+				nleaves += !entry->is_dir;
+			}
+
+			if (group_end - group_start < 2) {
+				/* A single entry cannot collide. */
+			}
+			else if (has_dir && nleaves > 0) {
+				for (k = group_start; k < group_end; k++) {
+					tree_path_entry *entry;
+
+					entry = git_vector_get(&entries, k);
+
+					if ((error = tree_path_report_add(report,
+							entry->path,
+							GIT_TREE_PATH_PROBLEM_FILE_DIRECTORY_COLLISION)) < 0)
+						goto done;
+				}
+			}
+			else {
+				/* Only leaves collide; directories merging is fine. */
+				for (k = group_start; k < group_end; k++) {
+					tree_path_entry *entry;
+
+					entry = git_vector_get(&entries, k);
+
+					if (entry->is_dir)
+						continue;
+
+					if ((error = tree_path_report_add(report,
+							entry->path,
+							GIT_TREE_PATH_PROBLEM_CASE_COLLISION)) < 0)
+						goto done;
+				}
+			}
+		}
+	}
+
+	git_vector_sort(&report->problems);
+	error = 0;
+
+done:
+	{
+		size_t k;
+		tree_path_entry *entry;
+		git_vector_foreach(&entries, k, entry)
+			tree_path_entry_free(entry);
+	}
+	git_vector_dispose(&entries);
+	git_str_dispose(&prefix);
+
+	if (error < 0) {
+		git_tree_path_report_free(report);
+		return error;
+	}
+
+	*out = report;
+	return 0;
+}
+
+size_t git_tree_path_report_entrycount(const git_tree_path_report *report)
+{
+	return report ? git_vector_length((git_vector *)&report->problems) : 0;
+}
+
+const git_tree_path_problem *git_tree_path_report_byindex(
+	const git_tree_path_report *report,
+	size_t idx)
+{
+	if (!report || idx >= git_vector_length(&report->problems))
+		return NULL;
+
+	return (const git_tree_path_problem *)
+		git_vector_get(&((git_tree_path_report *)report)->problems, idx);
+}
+
+void git_tree_path_report_free(git_tree_path_report *report)
+{
+	size_t i;
+
+	if (!report)
+		return;
+
+	for (i = 0; i < report->problems.length; i++) {
+		git_tree_path_problem *problem = git_vector_get(&report->problems, i);
+		git__free((void *)problem->path);
+		git__free(problem);
+	}
+
+	git_vector_dispose(&report->problems);
+	git__free(report);
+}
+
 /* Deprecated Functions */
 
 #ifndef GIT_DEPRECATE_HARD
