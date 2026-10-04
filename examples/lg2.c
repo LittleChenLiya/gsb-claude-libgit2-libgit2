@@ -19,6 +19,7 @@ struct {
 	{ "config",       lg2_config,       1 },
 	{ "describe",     lg2_describe,     1 },
 	{ "diff",         lg2_diff,         1 },
+	{ "diff-linemap", lg2_diff_linemap, 1 },
 	{ "fetch",        lg2_fetch,        1 },
 	{ "for-each-ref", lg2_for_each_ref, 1 },
 	{ "general",      lg2_general,      0 },

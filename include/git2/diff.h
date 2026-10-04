@@ -1530,6 +1530,162 @@ GIT_EXTERN(int) git_diff_patchid_options_init(
  */
 GIT_EXTERN(int) git_diff_patchid(git_oid *out, git_diff *diff, git_diff_patchid_options *opts);
 
+/*
+ * Line number mapping between the old and new versions of a delta.
+ *
+ * A `git_diff_linemap` is an index built on top of a single delta of a
+ * `git_diff` that translates line numbers between the old and the new
+ * version of the file.  It is intended for users that need to migrate
+ * information that is anchored to line numbers (for example, offline
+ * code review comments) across a diff.
+ *
+ * The mapping is derived exclusively from the hunk and line data of
+ * the delta; no content-based (fuzzy) matching is performed.  Lines
+ * that are unchanged map exactly, deleted lines report their deletion
+ * along with the position of the adjacent hunk, and added lines can be
+ * found through the reverse query.
+ *
+ * The index copies all the data it needs out of the diff, so it stays
+ * valid and usable after the `git_diff` it was built from has been
+ * freed.  The index and the diff must be freed independently with
+ * `git_diff_linemap_free` and `git_diff_free` respectively.
+ */
+
+/**
+ * A line number mapping index for a single delta of a diff.
+ */
+typedef struct git_diff_linemap git_diff_linemap;
+
+/**
+ * The status of a line mapping query.
+ */
+typedef enum {
+	/** The line maps to a line in the other version of the file. */
+	GIT_DIFF_LINEMAP_OK = 0,
+
+	/** The queried old-side line was deleted in the new version. */
+	GIT_DIFF_LINEMAP_DELETED = 1,
+
+	/** The queried new-side line was added in the new version. */
+	GIT_DIFF_LINEMAP_ADDED = 2,
+
+	/** The delta cannot be mapped (for example, a binary file). */
+	GIT_DIFF_LINEMAP_UNMAPPABLE = 3
+} git_diff_linemap_status_t;
+
+/**
+ * The result of a line mapping query.
+ */
+typedef struct {
+	/** The outcome of the query. */
+	git_diff_linemap_status_t status;
+
+	/**
+	 * The mapped 1-based line number in the other version of the
+	 * file; only set when `status` is `GIT_DIFF_LINEMAP_OK`,
+	 * -1 otherwise.
+	 */
+	int lineno;
+
+	/**
+	 * The index of the hunk adjacent to a deleted or added line;
+	 * only set when `status` is `GIT_DIFF_LINEMAP_DELETED` or
+	 * `GIT_DIFF_LINEMAP_ADDED`, `(size_t)-1` otherwise.
+	 */
+	size_t hunk_idx;
+
+	/**
+	 * For a deleted old-side line, the 1-based line number in the
+	 * new version of the file at the position where the deletion
+	 * occurred (that is, the new line that now sits where the
+	 * deleted line used to be, or one past the end of the hunk's
+	 * new range when the deletion is at its end).
+	 *
+	 * For an added new-side line, the 1-based line number in the
+	 * old version of the file before which the line was inserted
+	 * (or one past the end of the hunk's old range when the
+	 * addition is at its end).
+	 *
+	 * -1 when `status` is not `GIT_DIFF_LINEMAP_DELETED` or
+	 * `GIT_DIFF_LINEMAP_ADDED`.
+	 */
+	int adjacent_lineno;
+} git_diff_linemap_result;
+
+/**
+ * Build a line number mapping index for a single delta of a diff.
+ *
+ * The returned index is bound to the delta at `delta_idx` and keeps
+ * its own copies of the hunk and line data it needs; it remains valid
+ * after `diff` has been freed and must be released independently with
+ * `git_diff_linemap_free`.
+ *
+ * Deltas whose contents are binary cannot be mapped; the index can
+ * still be created, but queries against it will report
+ * `GIT_DIFF_LINEMAP_UNMAPPABLE`.
+ *
+ * @param out Pointer where the mapping index should be stored
+ * @param diff The diff that contains the delta
+ * @param delta_idx Index of the delta within the diff
+ * @return 0 on success, GIT_ENOTFOUND if `delta_idx` is out of range,
+ *         or an error code
+ */
+GIT_EXTERN(int) git_diff_linemap_new(
+	git_diff_linemap **out,
+	git_diff *diff,
+	size_t delta_idx);
+
+/**
+ * Map a line number of the old version of the file to the new version.
+ *
+ * Unchanged lines map exactly to their line in the new version.  A
+ * line that was deleted reports `GIT_DIFF_LINEMAP_DELETED` along with
+ * the adjacent hunk position instead of being mapped to a neighboring
+ * line.  If the delta is binary (or otherwise unmappable), the result
+ * reports `GIT_DIFF_LINEMAP_UNMAPPABLE`.
+ *
+ * @param out The query result
+ * @param map A line mapping index
+ * @param old_lineno 1-based line number in the old version of the file
+ * @return 0 on success (check `out->status` for the mapping outcome),
+ *         or an error code
+ */
+GIT_EXTERN(int) git_diff_linemap_old_to_new(
+	git_diff_linemap_result *out,
+	const git_diff_linemap *map,
+	int old_lineno);
+
+/**
+ * Map a line number of the new version of the file back to the old
+ * version (reverse query).
+ *
+ * Unchanged lines map exactly to their line in the old version.  A
+ * line that was added reports `GIT_DIFF_LINEMAP_ADDED` along with the
+ * adjacent hunk position.  If the delta is binary (or otherwise
+ * unmappable), the result reports `GIT_DIFF_LINEMAP_UNMAPPABLE`.
+ *
+ * @param out The query result
+ * @param map A line mapping index
+ * @param new_lineno 1-based line number in the new version of the file
+ * @return 0 on success (check `out->status` for the mapping outcome),
+ *         or an error code
+ */
+GIT_EXTERN(int) git_diff_linemap_new_to_old(
+	git_diff_linemap_result *out,
+	const git_diff_linemap *map,
+	int new_lineno);
+
+/**
+ * Deallocate a line mapping index.
+ *
+ * This only releases the index itself; the `git_diff` the index was
+ * built from is unaffected and must be freed separately with
+ * `git_diff_free`.
+ *
+ * @param map The mapping index to free, or NULL
+ */
+GIT_EXTERN(void) git_diff_linemap_free(git_diff_linemap *map);
+
 /** @} */
 GIT_END_DECL
 

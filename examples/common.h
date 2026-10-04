@@ -63,6 +63,7 @@ extern int lg2_commit(git_repository *repo, int argc, char **argv);
 extern int lg2_config(git_repository *repo, int argc, char **argv);
 extern int lg2_describe(git_repository *repo, int argc, char **argv);
 extern int lg2_diff(git_repository *repo, int argc, char **argv);
+extern int lg2_diff_linemap(git_repository *repo, int argc, char **argv);
 extern int lg2_fetch(git_repository *repo, int argc, char **argv);
 extern int lg2_for_each_ref(git_repository *repo, int argc, char **argv);
 extern int lg2_general(git_repository *repo, int argc, char **argv);
