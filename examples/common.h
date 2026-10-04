@@ -67,6 +67,7 @@ extern int lg2_fetch(git_repository *repo, int argc, char **argv);
 extern int lg2_for_each_ref(git_repository *repo, int argc, char **argv);
 extern int lg2_general(git_repository *repo, int argc, char **argv);
 extern int lg2_index_pack(git_repository *repo, int argc, char **argv);
+extern int lg2_lineindex(git_repository *repo, int argc, char **argv);
 extern int lg2_init(git_repository *repo, int argc, char **argv);
 extern int lg2_log(git_repository *repo, int argc, char **argv);
 extern int lg2_ls_files(git_repository *repo, int argc, char **argv);

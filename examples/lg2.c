@@ -23,6 +23,7 @@ struct {
 	{ "for-each-ref", lg2_for_each_ref, 1 },
 	{ "general",      lg2_general,      0 },
 	{ "index-pack",   lg2_index_pack,   1 },
+	{ "lineindex",    lg2_lineindex,    1 },
 	{ "init",         lg2_init,         0 },
 	{ "log",          lg2_log,          1 },
 	{ "ls-files",     lg2_ls_files,     1 },
