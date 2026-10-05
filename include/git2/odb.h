@@ -651,6 +651,180 @@ GIT_EXTERN(int) git_odb_get_backend(git_odb_backend **out, git_odb *odb, size_t 
  */
 GIT_EXTERN(int) git_odb_set_commit_graph(git_odb *odb, git_commit_graph *cgraph);
 
+/**
+ * An explicit, budgeted object read session.
+ *
+ * A read session wraps an existing object database and delivers
+ * objects only while they satisfy the session's constraints: the
+ * caller-selected set of allowed object types, a per-object byte
+ * budget and a total byte budget for the whole session.
+ *
+ * Budgets are charged against the actual decompressed (inflated)
+ * object content.  Every object delivered by the session is billed,
+ * including objects served from the ODB cache.  Failed reads deliver
+ * nothing and bill nothing.  The underlying object database and the
+ * default `git_odb_read` behavior are not modified in any way.
+ */
+typedef struct git_odb_read_session git_odb_read_session;
+
+/** Allow commit objects in a `git_odb_read_session`. */
+#define GIT_ODB_READ_SESSION_TYPE_COMMIT (1u << GIT_OBJECT_COMMIT)
+/** Allow tree objects in a `git_odb_read_session`. */
+#define GIT_ODB_READ_SESSION_TYPE_TREE   (1u << GIT_OBJECT_TREE)
+/** Allow blob objects in a `git_odb_read_session`. */
+#define GIT_ODB_READ_SESSION_TYPE_BLOB   (1u << GIT_OBJECT_BLOB)
+/** Allow tag objects in a `git_odb_read_session`. */
+#define GIT_ODB_READ_SESSION_TYPE_TAG    (1u << GIT_OBJECT_TAG)
+
+/**
+ * Options for configuring a `git_odb_read_session`.
+ *
+ * @options[version] GIT_ODB_READ_SESSION_OPTIONS_VERSION
+ * @options[init_macro] GIT_ODB_READ_SESSION_OPTIONS_INIT
+ * @options[init_function] git_odb_read_session_options_init
+ */
+typedef struct {
+	unsigned int version; /**< version for the struct */
+
+	/**
+	 * Bitmask of `GIT_ODB_READ_SESSION_TYPE_*` values selecting the
+	 * object types this session may deliver.  An object whose stored
+	 * type is not in this set is rejected with GIT_EINVALID; it is
+	 * never decoded as another (allowed) type.  0 allows all types.
+	 */
+	uint32_t allowed_types;
+
+	/**
+	 * Maximum decompressed size, in bytes, of any single object this
+	 * session may deliver; 0 means unlimited.  Objects larger than
+	 * this are rejected with GIT_EBUDGET.
+	 */
+	uint64_t max_object_bytes;
+
+	/**
+	 * Maximum total decompressed bytes this session may deliver
+	 * across all of its reads; 0 means unlimited.  A read that would
+	 * exceed the remaining budget is rejected with GIT_EBUDGET.
+	 */
+	uint64_t max_total_bytes;
+} git_odb_read_session_options;
+
+/** The current version of the read session options structure. */
+#define GIT_ODB_READ_SESSION_OPTIONS_VERSION 1
+
+/**
+ * Stack initializer for read session options.  Alternatively use
+ * `git_odb_read_session_options_init` programmatic initialization.
+ */
+#define GIT_ODB_READ_SESSION_OPTIONS_INIT { GIT_ODB_READ_SESSION_OPTIONS_VERSION }
+
+/**
+ * Initialize a `git_odb_read_session_options` with default values.
+ * Equivalent to creating an instance with
+ * GIT_ODB_READ_SESSION_OPTIONS_INIT.
+ *
+ * @param opts The `git_odb_read_session_options` struct to initialize.
+ * @param version The struct version; pass
+ *        `GIT_ODB_READ_SESSION_OPTIONS_VERSION`.
+ * @return 0 on success or -1 on failure.
+ */
+GIT_EXTERN(int) git_odb_read_session_options_init(
+	git_odb_read_session_options *opts,
+	unsigned int version);
+
+/**
+ * Open an explicit, budgeted read session over an existing ODB.
+ *
+ * The session does not take ownership of `db`; the caller must keep
+ * the object database alive for the lifetime of the session.
+ *
+ * @param[out] out location to store the session pointer.
+ * @param db the object database to read from.
+ * @param opts the session constraints, or NULL for defaults (all
+ *        types allowed, unlimited budgets).
+ * @return 0 on success or an error code.
+ */
+GIT_EXTERN(int) git_odb_read_session_open(
+	git_odb_read_session **out,
+	git_odb *db,
+	const git_odb_read_session_options *opts);
+
+/**
+ * Close a read session and release its resources.
+ *
+ * @param session the session to close; NULL is a no-op.
+ */
+GIT_EXTERN(void) git_odb_read_session_free(git_odb_read_session *session);
+
+/**
+ * Get the total number of decompressed content bytes this session
+ * has delivered (and billed) so far.
+ *
+ * @param session the session to query.
+ * @return the billed byte count.
+ */
+GIT_EXTERN(uint64_t) git_odb_read_session_spent(git_odb_read_session *session);
+
+/**
+ * Read a single object through the session, enforcing the allowed
+ * types and both byte budgets.
+ *
+ * The object is located through the ordinary ODB read path, so it
+ * may be served from the ODB cache; cache hits are still billed as
+ * bytes delivered by this session.  On any error (object missing,
+ * type not allowed, budget exceeded) nothing is delivered, `out` is
+ * set to NULL and the session's billed total is left unchanged.
+ *
+ * @param[out] out pointer where to store the read object; set to
+ *        NULL on error.
+ * @param session the read session.
+ * @param id identity of the object to read.
+ * @return 0 on success, GIT_ENOTFOUND if the object is not in the
+ *         database, GIT_EINVALID if its type is not allowed, or
+ *         GIT_EBUDGET if a byte budget would be exceeded.
+ */
+GIT_EXTERN(int) git_odb_read_session_read(
+	git_odb_object **out,
+	git_odb_read_session *session,
+	const git_oid *id);
+
+/**
+ * Follow a single caller-selected reference edge from one object to
+ * another, delivering the referenced object through the session.
+ *
+ * Reference traversal only ever follows the edges the caller selects
+ * by invoking this function; the session never enumerates or follows
+ * references on its own.
+ *
+ * If the target object was already delivered through an earlier edge
+ * of this session, the reference is deduplicated: the object is not
+ * delivered or billed again, GIT_ITEROVER is returned, and the
+ * source of the edge that first delivered the object is reported in
+ * `first_source` (if the object was first reached as a root, with no
+ * source, `first_source` is zeroed).
+ *
+ * @param[out] out pointer where to store the read object, or NULL if
+ *        the caller does not need it; set to NULL on error or
+ *        deduplication.
+ * @param[out] first_source for a deduplicated reference, the object
+ *        through which the target was first delivered; may be NULL if
+ *        the caller does not need it.
+ * @param session the read session.
+ * @param from the referencing object (the source of this edge), or
+ *        NULL if the target is a root of the traversal.
+ * @param to the referenced object to deliver.
+ * @return 0 if the object was delivered, GIT_ITEROVER if the
+ *         reference was deduplicated, GIT_ENOTFOUND if the object is
+ *         not in the database, GIT_EINVALID if its type is not
+ *         allowed, or GIT_EBUDGET if a byte budget would be exceeded.
+ */
+GIT_EXTERN(int) git_odb_read_session_follow(
+	git_odb_object **out,
+	git_oid *first_source,
+	git_odb_read_session *session,
+	const git_oid *from,
+	const git_oid *to);
+
 /** @} */
 GIT_END_DECL
 

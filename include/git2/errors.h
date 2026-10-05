@@ -69,7 +69,8 @@ typedef enum {
 	GIT_TIMEOUT         = -37,	/**< The operation timed out */
 	GIT_EUNCHANGED      = -38,	/**< There were no changes */
 	GIT_ENOTSUPPORTED   = -39,	/**< An option is not supported */
-	GIT_EREADONLY       = -40	/**< The subject is read-only */
+	GIT_EREADONLY       = -40,	/**< The subject is read-only */
+	GIT_EBUDGET         = -41	/**< A configured budget was exceeded */
 } git_error_code;
 
 /**
