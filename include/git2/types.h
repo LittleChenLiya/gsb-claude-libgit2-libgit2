@@ -281,6 +281,11 @@ typedef struct git_cert git_cert;
 typedef struct git_submodule git_submodule;
 
 /**
+ * Opaque structure representing a read-only submodule update plan.
+ */
+typedef struct git_submodule_update_plan git_submodule_update_plan;
+
+/**
  * Submodule update values
  *
  * These values represent settings for the `submodule.$name.update`
