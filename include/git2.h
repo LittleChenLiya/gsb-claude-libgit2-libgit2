@@ -46,6 +46,7 @@
 #include "git2/oid.h"
 #include "git2/pack.h"
 #include "git2/patch.h"
+#include "git2/pathhistory.h"
 #include "git2/pathspec.h"
 #include "git2/proxy.h"
 #include "git2/rebase.h"
